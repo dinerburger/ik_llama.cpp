@@ -638,6 +638,7 @@ const char * common_chat_format_name(common_chat_format format) {
         case COMMON_CHAT_FORMAT_COMMAND_R7B: return "Command R7B";
         case COMMON_CHAT_FORMAT_GRANITE: return "Granite";
         case COMMON_CHAT_FORMAT_GPT_OSS: return "GPT-OSS";
+        case COMMON_CHAT_FORMAT_SEED_OSS: return "Seed-OSS";
         case COMMON_CHAT_FORMAT_MINIMAX_M2: return "MiniMax-M2";
         case COMMON_CHAT_FORMAT_GLM_4_5: return "GLM 4.5";
         case COMMON_CHAT_FORMAT_KIMI_K2: return "Kimi K2";
@@ -2627,6 +2628,74 @@ static common_chat_params common_chat_params_init_without_tools(const common_cha
     return data;
 }
 
+static void common_chat_parse_seed_oss(common_chat_msg_parser & builder) {
+    static const xml_tool_call_format form {
+        /* form.scope_start = */ "<seed:tool_call>",
+        /* form.tool_start  = */ "<function=",
+        /* form.tool_sep    = */ ">",
+        /* form.key_start   = */ "<parameter=",
+        /* form.key_val_sep = */ ">",
+        /* form.val_end     = */ "</parameter>",
+        /* form.tool_end    = */ "</function>",
+        /* form.scope_end   = */ "</seed:tool_call>",
+    };
+    builder.consume_reasoning_with_xml_tool_calls(form, "<seed:think>", "</seed:think>");
+}
+
+static common_chat_params common_chat_params_init_seed_oss(
+    const common_chat_template         & tmpl,
+    templates_params                   & params,
+    const common_chat_templates_inputs & inputs)
+{
+    common_chat_params data;
+    data.prompt = apply(tmpl, params);
+    data.format = COMMON_CHAT_FORMAT_SEED_OSS;
+    if (string_ends_with(data.prompt, "<seed:think>")) {
+        if (!inputs.enable_thinking) {
+            data.prompt += "</seed:think>";
+        } else {
+            data.thinking_forced_open = true;
+        }
+    }
+
+    if (params.tools.is_array() && !params.tools.empty()) {
+        data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            std::vector<std::string> tool_rules;
+            foreach_function(params.tools, [&](const json & tool) {
+                const auto & function   = tool.at("function");
+                std::string  name       = function.at("name");
+                auto         parameters = function.at("parameters");
+                builder.resolve_refs(parameters);
+
+                // Create rule for Seed-OSS function call format
+                std::string param_rules;
+                if (parameters.contains("properties")) {
+                    for (const auto & [key, value] : parameters.at("properties").items()) {
+                        param_rules += "\"<parameter=" + key + ">\"" + builder.add_schema(name + "-arg-" + key, value) +
+                                       "\"</parameter>\"";
+                    }
+                }
+
+                tool_rules.push_back(builder.add_rule(name + "-call",
+                                                      "\"<seed:tool_call>\" space \"<function=" + name + ">\" space " +
+                                                          param_rules +
+                                                          " \"</function>\" space \"</seed:tool_call>\""));
+            });
+
+            data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<seed:tool_call>" });
+
+            data.preserved_tokens = {
+                "<seed:think>", "</seed:think>", "<seed:tool_call>", "</seed:tool_call>",
+                "<function=",   "</function>",   "<parameter=",      "</parameter>",
+            };
+
+            builder.add_rule("root", string_join(tool_rules, " | "));
+        });
+    }
+    return data;
+}
+
 static common_chat_params common_chat_templates_apply_jinja(
     const struct common_chat_templates * tmpls,
     const struct common_chat_templates_inputs & inputs)
@@ -2730,6 +2799,11 @@ static common_chat_params common_chat_templates_apply_jinja(
     // GPT-OSS
     if (src.find("<|channel|>") != std::string::npos && params.json_schema.is_null()) {
         return common_chat_params_init_gpt_oss(tmpl, params);
+    }
+
+    // Seed-OSS
+    if (src.find("<seed:think>") != std::string::npos) {
+        return common_chat_params_init_seed_oss(tmpl, params, inputs);
     }
 
     // MiniMax-M2 format detection
@@ -2931,6 +3005,9 @@ static void common_chat_parse(common_chat_msg_parser & builder) {
             break;
         case COMMON_CHAT_FORMAT_APRIEL_1_5:
             common_chat_parse_apriel_1_5(builder);
+            break;
+        case COMMON_CHAT_FORMAT_SEED_OSS:
+            common_chat_parse_seed_oss(builder);
             break;
         case COMMON_CHAT_FORMAT_XIAOMI_MIMO:
             common_chat_parse_xiaomi_mimo(builder);
